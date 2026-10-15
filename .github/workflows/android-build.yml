@@ -4,17 +4,12 @@ name: Build Android APK from ZIP
 on:
   workflow_dispatch:
   push:
-    branches: [main, master]
     paths:
       - "*.zip"
       - ".github/workflows/build-apk.yml"
 
 permissions:
   contents: read
-
-concurrency:
-  group: android-zip-build-${{ github.ref }}
-  cancel-in-progress: true
 
 jobs:
   build:
@@ -30,133 +25,132 @@ jobs:
         id: source
         shell: bash
         run: |
-          set -euo pipefail
+          shopt -s nullglob
+          zips=( "$GITHUB_WORKSPACE"/*.zip )
 
-          mapfile -t ZIPS < <(
-            find "$GITHUB_WORKSPACE" \
-              -maxdepth 1 -type f -iname "*.zip"
-          )
-
-          if [ "${#ZIPS[@]}" -eq 0 ]; then
-            echo "ERROR: No source ZIP found in repository root."
-            echo "Upload ThugLife-source.zip to the root of the repository."
+          if [ "${#zips[@]}" -eq 0 ]; then
+            echo "::error::No ZIP file found in repository root."
             exit 1
           fi
 
-          if [ "${#ZIPS[@]}" -gt 1 ]; then
-            echo "ERROR: Multiple ZIP files found. Keep only one source ZIP in the repository root."
-            printf '%s\n' "${ZIPS[@]}"
+          if [ "${#zips[@]}" -gt 1 ]; then
+            echo "::error::Multiple ZIP files found. Keep only one source ZIP in the repository root."
+            printf '%s\n' "${zips[@]}"
             exit 1
           fi
 
-          echo "zip=${ZIPS[0]}" >> "$GITHUB_OUTPUT"
+          echo "zip_path=${zips[0]}" >> "$GITHUB_OUTPUT"
+          echo "Found source ZIP: $(basename "${zips[0]}")"
 
-      - name: Extract source ZIP
+      - name: Extract Android project
+        id: extract
         shell: bash
         run: |
-          set -euo pipefail
+          EXTRACT_DIR="$RUNNER_TEMP/android-source"
+          mkdir -p "$EXTRACT_DIR"
 
-          mkdir -p "$RUNNER_TEMP/android-source"
+          unzip -q "${{ steps.source.outputs.zip_path }}" -d "$EXTRACT_DIR"
 
-          unzip -q "${{ steps.source.outputs.zip }}" \
-            -d "$RUNNER_TEMP/android-source"
+          SETTINGS_FILE="$(find "$EXTRACT_DIR" \
+            -type f \( -name settings.gradle -o -name settings.gradle.kts \) \
+            -not -path '*/.gradle/*' \
+            -print -quit)"
 
-          PROJECT_DIR=""
-
-          while IFS= read -r -d '' SETTINGS; do
-            CANDIDATE="$(dirname "$SETTINGS")"
-
-            if [ -f "$CANDIDATE/app/build.gradle.kts" ] ||
-               [ -f "$CANDIDATE/app/build.gradle" ]; then
-              PROJECT_DIR="$CANDIDATE"
-              break
-            fi
-          done < <(
-            find "$RUNNER_TEMP/android-source" \
-              -type f \
-              \( -name settings.gradle.kts -o -name settings.gradle \) \
-              -not -path '*/.gradle/*' \
-              -print0
-          )
-
-          if [ -z "$PROJECT_DIR" ]; then
-            echo "ERROR: Android project root not found."
-            echo "Expected settings.gradle(.kts) and app/build.gradle(.kts)."
-            find "$RUNNER_TEMP/android-source" -maxdepth 4 -type f
+          if [ -z "$SETTINGS_FILE" ]; then
+            echo "::error::Could not find settings.gradle or settings.gradle.kts in the ZIP."
+            find "$EXTRACT_DIR" -maxdepth 4 -type f | head -100
             exit 1
           fi
 
-          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-          echo "Detected project: $PROJECT_DIR"
+          PROJECT_DIR="$(dirname "$SETTINGS_FILE")"
 
+          if [ ! -f "$PROJECT_DIR/app/build.gradle" ] && \
+             [ ! -f "$PROJECT_DIR/app/build.gradle.kts" ]; then
+            echo "::error::Could not find app/build.gradle or app/build.gradle.kts."
+            echo "Detected project directory: $PROJECT_DIR"
+            find "$PROJECT_DIR" -maxdepth 3 -type f | head -100
+            exit 1
+          fi
+
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+          echo "Android project found at: $PROJECT_DIR"
           ls -la "$PROJECT_DIR"
 
-      - name: Set up JDK 17
+      - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
+          cache: gradle
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install Android SDK packages
+      - name: Accept Android SDK licenses
+        shell: bash
         run: |
-          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+          yes | sdkmanager --licenses || true
+          sdkmanager --licenses </dev/null
 
-      - name: Set up Gradle 8.9
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
+
+      - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.9"
 
-      - name: Validate bundled content
+      - name: Validate project content
         shell: bash
         run: |
-          set -euo pipefail
-          cd "$PROJECT_DIR"
-
-          if [ -f tools/validate_content.py ]; then
-            python3 --version
-            python3 tools/validate_content.py
+          if [ -f "$PROJECT_DIR/tools/validate_content.py" ]; then
+            python3 "$PROJECT_DIR/tools/validate_content.py"
+          elif [ -f "$PROJECT_DIR/validate_content.py" ]; then
+            python3 "$PROJECT_DIR/validate_content.py"
           else
-            echo "No content validator found; skipping this optional check."
+            echo "No content validation script found; skipping."
           fi
 
       - name: Run unit tests
+        working-directory: ${{ steps.extract.outputs.project_dir }}
         shell: bash
         run: |
-          set -euo pipefail
-          cd "$PROJECT_DIR"
           gradle --no-daemon :app:testDebugUnitTest
 
       - name: Build debug APK
+        working-directory: ${{ steps.extract.outputs.project_dir }}
         shell: bash
         run: |
-          set -euo pipefail
-          cd "$PROJECT_DIR"
           gradle --no-daemon :app:assembleDebug
 
-      - name: Verify APK
+      - name: Verify APK exists
+        id: apk
         shell: bash
         run: |
-          set -euo pipefail
+          APK_PATH="$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk"
 
-          APK="$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk"
-
-          if [ ! -s "$APK" ]; then
-            echo "ERROR: Debug APK missing or empty."
-            find "$PROJECT_DIR/app/build/outputs" -type f || true
+          if [ ! -f "$APK_PATH" ]; then
+            echo "::error::APK was not generated at the expected path."
+            echo "Searching for APK files..."
+            find "$PROJECT_DIR" -type f -name "*.apk" -print
             exit 1
           fi
 
-          echo "APK created successfully:"
-          ls -lh "$APK"
+          echo "apk_path=$APK_PATH" >> "$GITHUB_OUTPUT"
+          ls -lh "$APK_PATH"
 
-      - name: Upload APK artifact
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: ThugLife-debug-APK
-          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
+          path: ${{ steps.apk.outputs.apk_path }}
           if-no-files-found: error
           retention-days: 14
 
@@ -165,7 +159,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ThugLife-test-reports
-          path: ${{ env.PROJECT_DIR }}/app/build/reports/tests/testDebugUnitTest/
-          if-no-files-found: warn
+          path: |
+            ${{ steps.extract.outputs.project_dir }}/app/build/reports/tests/
+            ${{ steps.extract.outputs.project_dir }}/app/build/test-results/
+          if-no-files-found: ignore
           retention-days: 7
-          
