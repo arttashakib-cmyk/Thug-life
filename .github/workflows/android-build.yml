@@ -95,18 +95,13 @@ jobs:
           java-version: '17'
 
       # ---------- 5) Android SDK ----------
+      # نکته: در android-actions/setup-android@v3 پکیج 'tools' دیگر در مخزن گوگل نیست؛
+      # پس با packages: '' هیچ پکیج اضافه‌ای درخواست نمی‌شود.
+      # AGP هنگام بیلد خودش platform و build-tools را دانلود می‌کند.
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
-
-      - name: Install SDK packages
-        run: |
-          yes | sdkmanager --licenses >/dev/null 2>&1 || true
-          sdkmanager --install \
-            "platform-tools" \
-            "platforms;android-35" \
-            "build-tools;35.0.0"
-        env:
-          ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}
+        with:
+          packages: ''
 
       # ---------- 6) Gradle 8.9 (با کش داخلی) ----------
       - name: Set up Gradle
