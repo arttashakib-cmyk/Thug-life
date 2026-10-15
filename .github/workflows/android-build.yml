@@ -1,185 +1,171 @@
-# .github/workflows/android-build.yml
-name: Android Build
+
+name: Build Android APK from ZIP
 
 on:
-  push:
-    branches: [ main, master ]
-    tags: [ 'v*' ]
-  pull_request:
-    branches: [ main, master ]
   workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths:
+      - "*.zip"
+      - ".github/workflows/build-apk.yml"
 
 permissions:
   contents: read
 
 concurrency:
-  group: android-build-${{ github.ref }}
+  group: android-zip-build-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   build:
-    name: Extract & Build APK
+    name: Extract, Test and Build APK
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 45
 
     steps:
-      # ---------- 1) checkout ----------
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
 
-      # ---------- 2) باز کردن زیپ پروژه ----------
-      - name: Extract project zip (if present)
+      - name: Find source ZIP
+        id: source
         shell: bash
         run: |
           set -euo pipefail
 
-          # زیپ را در کل مخزن (به جز .git) پیدا کن
-          ZIP="$(find . -path ./.git -prune -o -iname '*.zip' -type f -print | head -n 1 || true)"
-          if [ -z "${ZIP:-}" ]; then
-            echo "::notice::هیچ فایل zip پیدا نشد؛ فرض می‌کنیم سورس‌ها از قبل در ریشه هستند."
-            ls -la
-            exit 0
-          fi
+          mapfile -t ZIPS < <(
+            find "$GITHUB_WORKSPACE" \
+              -maxdepth 1 -type f -iname "*.zip"
+          )
 
-          echo "Found archive: $ZIP"
-          rm -rf _extracted
-          mkdir -p _extracted
-          unzip -q "$ZIP" -d _extracted
-
-          # پوشه‌ای که settings.gradle(.kts) دارد = ریشه پروژه واقعی
-          SETTINGS="$(find _extracted -maxdepth 4 \
-                        \( -name 'settings.gradle.kts' -o -name 'settings.gradle' \) \
-                        -print | head -n 1 || true)"
-          if [ -z "${SETTINGS:-}" ]; then
-            echo "::error::داخل زیپ هیچ settings.gradle(.kts) پیدا نشد."
-            find _extracted -maxdepth 3 -print
+          if [ "${#ZIPS[@]}" -eq 0 ]; then
+            echo "ERROR: No source ZIP found in repository root."
+            echo "Upload ThugLife-source.zip to the root of the repository."
             exit 1
           fi
 
-          PROJ_DIR="$(dirname "$SETTINGS")"
-          echo "Project root inside zip: $PROJ_DIR"
-
-          # --- انتقال محتوای زیپ به ریشه‌ی workspace ---
-          # .github عمداً exclude می‌شود تا workflow در حال اجرا از بین نرود
-          rsync -a --exclude='.github' "$PROJ_DIR"/ ./
-
-          # اگر داخل زیپ هم .github بود، فقط فایل‌های جدیدش را اضافه کن (no-clobber)
-          if [ -d "$PROJ_DIR/.github" ]; then
-            mkdir -p .github
-            cp -rn "$PROJ_DIR/.github/." ./.github/ 2>/dev/null || true
+          if [ "${#ZIPS[@]}" -gt 1 ]; then
+            echo "ERROR: Multiple ZIP files found. Keep only one source ZIP in the repository root."
+            printf '%s\n' "${ZIPS[@]}"
+            exit 1
           fi
 
-          rm -rf _extracted
-          rm -f "$ZIP"
+          echo "zip=${ZIPS[0]}" >> "$GITHUB_OUTPUT"
 
-          echo "Workspace after extraction:"
-          ls -la
-
-      # ---------- 3) چک سریع ساختار ----------
-      - name: Verify project files
+      - name: Extract source ZIP
+        shell: bash
         run: |
-          set -e
-          test -f settings.gradle.kts || test -f settings.gradle \
-            || { echo "::error::settings.gradle(.kts) موجود نیست"; exit 1; }
-          test -f app/build.gradle.kts  || test -f app/build.gradle \
-            || { echo "::error::app/build.gradle(.kts) موجود نیست"; exit 1; }
-          echo "OK: ساختار پروژه پیدا شد."
+          set -euo pipefail
 
-      # ---------- 4) JDK 17 ----------
+          mkdir -p "$RUNNER_TEMP/android-source"
+
+          unzip -q "${{ steps.source.outputs.zip }}" \
+            -d "$RUNNER_TEMP/android-source"
+
+          PROJECT_DIR=""
+
+          while IFS= read -r -d '' SETTINGS; do
+            CANDIDATE="$(dirname "$SETTINGS")"
+
+            if [ -f "$CANDIDATE/app/build.gradle.kts" ] ||
+               [ -f "$CANDIDATE/app/build.gradle" ]; then
+              PROJECT_DIR="$CANDIDATE"
+              break
+            fi
+          done < <(
+            find "$RUNNER_TEMP/android-source" \
+              -type f \
+              \( -name settings.gradle.kts -o -name settings.gradle \) \
+              -not -path '*/.gradle/*' \
+              -print0
+          )
+
+          if [ -z "$PROJECT_DIR" ]; then
+            echo "ERROR: Android project root not found."
+            echo "Expected settings.gradle(.kts) and app/build.gradle(.kts)."
+            find "$RUNNER_TEMP/android-source" -maxdepth 4 -type f
+            exit 1
+          fi
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Detected project: $PROJECT_DIR"
+
+          ls -la "$PROJECT_DIR"
+
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: "17"
 
-      # ---------- 5) Android SDK ----------
-      # نکته: در android-actions/setup-android@v3 پکیج 'tools' دیگر در مخزن گوگل نیست؛
-      # پس با packages: '' هیچ پکیج اضافه‌ای درخواست نمی‌شود.
-      # AGP هنگام بیلد خودش platform و build-tools را دانلود می‌کند.
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
-        with:
-          packages: ''
 
-      # ---------- 6) Gradle 8.9 (با کش داخلی) ----------
-      - name: Set up Gradle
+      - name: Install Android SDK packages
+        run: |
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Set up Gradle 8.9
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: '8.9'
-          cache-read-only: false
+          gradle-version: "8.9"
 
-      - name: Make gradlew executable
+      - name: Validate bundled content
+        shell: bash
         run: |
-          [ -f ./gradlew ] && chmod +x ./gradlew || true
+          set -euo pipefail
+          cd "$PROJECT_DIR"
 
-      # ---------- 7) بیلد دیباگ ----------
+          if [ -f tools/validate_content.py ]; then
+            python3 --version
+            python3 tools/validate_content.py
+          else
+            echo "No content validator found; skipping this optional check."
+          fi
+
+      - name: Run unit tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          gradle --no-daemon :app:testDebugUnitTest
+
       - name: Build debug APK
-        env:
-          GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx4g -Dorg.gradle.daemon=false"
+        shell: bash
         run: |
-          if [ -f ./gradlew ]; then
-            ./gradlew :app:assembleDebug --no-daemon --stacktrace
-          else
-            gradle    :app:assembleDebug --no-daemon --stacktrace
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          gradle --no-daemon :app:assembleDebug
+
+      - name: Verify APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK="$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk"
+
+          if [ ! -s "$APK" ]; then
+            echo "ERROR: Debug APK missing or empty."
+            find "$PROJECT_DIR/app/build/outputs" -type f || true
+            exit 1
           fi
 
-      # ---------- 8) اگر Secrets امضا تنظیم شده بود، نسخه‌ی release هم بساز ----------
-      - name: Check signing secrets
-        id: signing
-        env:
-          KEYSTORE_B64: ${{ secrets.THUGLIFE_KEYSTORE_BASE64 }}
-        run: |
-          if [ -n "${KEYSTORE_B64:-}" ]; then
-            echo "enabled=true"  >> "$GITHUB_OUTPUT"
-          else
-            echo "enabled=false" >> "$GITHUB_OUTPUT"
-          fi
+          echo "APK created successfully:"
+          ls -lh "$APK"
 
-      - name: Build release APK
-        if: steps.signing.outputs.enabled == 'true'
-        env:
-          GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx4g -Dorg.gradle.daemon=false"
-          THUGLIFE_KEYSTORE_FILE:     ${{ github.workspace }}/release.keystore
-          THUGLIFE_KEYSTORE_PASSWORD: ${{ secrets.THUGLIFE_KEYSTORE_PASSWORD }}
-          THUGLIFE_KEY_ALIAS:         ${{ secrets.THUGLIFE_KEY_ALIAS }}
-          THUGLIFE_KEY_PASSWORD:      ${{ secrets.THUGLIFE_KEY_PASSWORD }}
-        run: |
-          echo "${{ secrets.THUGLIFE_KEYSTORE_BASE64 }}" | base64 -d > release.keystore
-          if [ -f ./gradlew ]; then
-            ./gradlew :app:assembleRelease --no-daemon --stacktrace
-          else
-            gradle    :app:assembleRelease --no-daemon --stacktrace
-          fi
-          rm -f release.keystore
-
-      # ---------- 9) آپلود artifactها ----------
-      - name: Upload debug APK
-        if: always()
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: thuglife-debug-apk
-          path: '**/build/outputs/apk/debug/*.apk'
-          if-no-files-found: warn
+          name: ThugLife-debug-APK
+          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
           retention-days: 14
 
-      - name: Upload release APK
-        if: steps.signing.outputs.enabled == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: thuglife-release-apk
-          path: '**/build/outputs/apk/release/*.apk'
-          if-no-files-found: warn
-          retention-days: 30
-
-      - name: Upload build reports
+      - name: Upload test reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-reports
-          path: |
-            **/build/reports/**
-            **/build/outputs/logs/**
-          if-no-files-found: ignore
+          name: ThugLife-test-reports
+          path: ${{ env.PROJECT_DIR }}/app/build/reports/tests/testDebugUnitTest/
+          if-no-files-found: warn
           retention-days: 7
+          
