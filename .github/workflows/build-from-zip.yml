@@ -17,37 +17,30 @@ jobs:
   build:
     name: Unzip + Build Debug APK
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 45
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # --- باز کردن زیپ ---
       - name: Unzip ThugLife source
         run: |
-          # اسم فایل زیپ رو اینجا عوض کن اگر فرق داره
           ZIP_FILE="ThugLife-source.zip"
-          
           if [ ! -f "$ZIP_FILE" ]; then
             echo "❌ فایل $ZIP_FILE پیدا نشد!"
             ls -la
             exit 1
           fi
-          
           unzip -q "$ZIP_FILE"
-          
-          # محتویات زیپ داخل پوشه ThugLife هست
           if [ -d "ThugLife" ]; then
             echo "✅ زیپ باز شد"
             ls -la ThugLife/
           else
-            echo "❌ پوشه ThugLife پیدا نشد بعد از unzip"
+            echo "❌ پوشه ThugLife پیدا نشد"
             exit 1
           fi
 
-      # --- محیط بیلد ---
-      - name: Setup Java 17
+      - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -55,16 +48,18 @@ jobs:
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          packages: ''   # هیچ پکیج پیش‌فرضی نصب نکن
 
-      - name: Install Android packages
-        run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+      - name: Install required SDK packages
+        run: |
+          sdkmanager "platforms;android-35" "build-tools;35.0.0" "platform-tools"
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.9"
 
-      # --- ولیدیشن محتوا (اختیاری ولی مفید) ---
       - name: Validate content
         working-directory: ThugLife
         run: |
@@ -74,12 +69,10 @@ jobs:
             echo "validate_content.py پیدا نشد، رد می‌شیم"
           fi
 
-      # --- تست یونیت ---
       - name: Run unit tests
         working-directory: ThugLife
         run: gradle --no-daemon :app:testDebugUnitTest
 
-      # --- بیلد APK دیباگ ---
       - name: Build debug APK
         working-directory: ThugLife
         run: gradle --no-daemon :app:assembleDebug
@@ -90,7 +83,6 @@ jobs:
           ls -lh app/build/outputs/apk/debug/
           test -s app/build/outputs/apk/debug/app-debug.apk
 
-      # --- آپلود آرتیفکت ---
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
         with:
